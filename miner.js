@@ -25,23 +25,11 @@ const ABI = [
 if (!isMainThread) {
   const { challenge, difficulty, startNonce, workerId } = workerData;
 
-  // Gunakan Node.js built-in crypto — zero dependency, tidak OOM, cukup cepat
-  // Node 21+ support keccak256 native. Versi lebih lama fallback ke ethers.
-  const { createHash } = require("crypto");
-
-  let useNativeCrypto = false;
-  try {
-    createHash("keccak256").update(Buffer.alloc(1)).digest();
-    useNativeCrypto = true;
-  } catch (_) {
-    useNativeCrypto = false;
-  }
-
-  // Alokasi buffer SEKALI di luar loop — zero GC pressure
+  // Alokasi buffer SEKALI — zero GC pressure dalam loop
   const challengeBuf = Buffer.from(challenge.slice(2), "hex");
   const packed       = Buffer.allocUnsafe(64);
   const nonceBuf     = Buffer.allocUnsafe(32);
-  challengeBuf.copy(packed, 0); // bytes 0-31 = challenge (konstan)
+  challengeBuf.copy(packed, 0);
 
   const diffBuf = Buffer.from(
     BigInt(difficulty).toString(16).padStart(64, "0"), "hex"
@@ -66,12 +54,36 @@ if (!isMainThread) {
     return false;
   }
 
-  if (useNativeCrypto) {
-    // PATH 1: Node built-in keccak256 — stabil, tidak OOM
+  // Coba keccak native — tapi reuse instance via copy trick (anti-OOM)
+  let hashFn = null;
+  try {
+    // Pakai js-sha3 — pure JS tapi cepat dan tidak OOM
+    const { keccak256 } = require("js-sha3");
+    // Hasilnya hex string, convert ke Buffer
+    hashFn = (buf) => Buffer.from(keccak256.arrayBuffer(buf));
+    hashFn(Buffer.alloc(1)); // test
+  } catch (_) {
+    hashFn = null;
+  }
+
+  if (!hashFn) {
+    try {
+      // Fallback: keccak npm — pakai arraybuffer untuk avoid string alloc
+      const Keccak = require("keccak");
+      // Buat factory function — create fresh per hash tapi lightweight
+      hashFn = (buf) => Keccak("keccak256").update(buf).digest();
+      hashFn(Buffer.alloc(1));
+    } catch (_) {
+      hashFn = null;
+    }
+  }
+
+  if (hashFn) {
+    // PATH CEPAT: native/js-sha3
     while (true) {
       writeBE(nonceBuf, nonce);
       nonceBuf.copy(packed, 32);
-      const hash = createHash("keccak256").update(packed).digest();
+      const hash = hashFn(packed);
       attempts++;
       if (bufLT(hash, diffBuf)) {
         parentPort.postMessage({ type: "found", nonce: nonce.toString(), hash: "0x" + hash.toString("hex"), workerId });
@@ -81,7 +93,7 @@ if (!isMainThread) {
       if (attempts % REPORT_EVERY === 0) parentPort.postMessage({ type: "progress", attempts, workerId });
     }
   } else {
-    // PATH 2: ethers solidityPackedKeccak256 — fallback, lebih lambat
+    // PATH FALLBACK: ethers
     const { solidityPackedKeccak256 } = require("ethers");
     const diffBigInt = BigInt(difficulty);
     while (true) {
@@ -185,8 +197,10 @@ if (!isMainThread) {
     const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
     const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 
+    // Deteksi hash mode
     let hashMode = "ethers fallback";
-    try { require("crypto").createHash("keccak256").update(Buffer.alloc(1)).digest(); hashMode = "Node crypto keccak256 (native)"; } catch (_) {}
+    try { require("js-sha3"); hashMode = "js-sha3 (fast pure JS)"; } catch (_) {}
+    try { require("keccak"); hashMode = "keccak native C"; } catch (_) {}
 
     log("==========================================");
     log("  HASH256 Multi-Core CPU Miner");
