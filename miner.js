@@ -16,27 +16,33 @@ const ABI = [
 ];
 
 // ─── WORKER THREAD ────────────────────────────────────────────────────────────
-// Pakai native keccak (C binding) — jauh lebih cepat dari ethers.js
 if (!isMainThread) {
-  let keccak256native;
-  try {
-    const keccakLib = require("keccak");
-    keccak256native = (buf) => keccakLib("keccak256").update(buf).digest();
-  } catch (_) {
-    // fallback ke ethers jika keccak belum terinstall
-    const { keccak256 } = require("ethers");
-    keccak256native = (buf) => Buffer.from(keccak256(buf).slice(2), "hex");
-  }
-
   const { challenge, difficulty, startNonce, workerId } = workerData;
 
+  // Native keccak256 — pakai keccak npm dengan API yang benar
+  let keccak256native;
+  try {
+    const Keccak = require("keccak");
+    // Test dulu apakah bisa jalan
+    Keccak("keccak256").update(Buffer.alloc(1)).digest();
+    keccak256native = (buf) => {
+      return Keccak("keccak256").update(buf).digest();
+    };
+  } catch (e) {
+    // Fallback: pakai ethers solidityPackedKeccak256
+    const { solidityPackedKeccak256 } = require("ethers");
+    keccak256native = null; // flag untuk pakai mode ethers
+  }
+
   const challengeBuf = Buffer.from(challenge.slice(2), "hex"); // 32 bytes
-  const nonceBuf = Buffer.alloc(32);                           // 32 bytes, reused
-  const packed = Buffer.allocUnsafe(64);                       // 64 bytes, reused
+  const nonceBuf = Buffer.alloc(32);
+  const packed = Buffer.allocUnsafe(64);
   challengeBuf.copy(packed, 0);
 
-  // difficulty -> 32-byte big-endian buffer untuk komparasi cepat
-  const diffBuf = Buffer.from(BigInt(difficulty).toString(16).padStart(64, "0"), "hex");
+  const diffBuf = Buffer.from(
+    BigInt(difficulty).toString(16).padStart(64, "0"),
+    "hex"
+  );
 
   let nonce = BigInt(startNonce);
   let attempts = 0;
@@ -50,7 +56,6 @@ if (!isMainThread) {
     }
   }
 
-  // Bandingkan buffer 32 byte: apakah a < b?
   function bufLessThan(a, b) {
     for (let i = 0; i < 32; i++) {
       if (a[i] < b[i]) return true;
@@ -59,27 +64,53 @@ if (!isMainThread) {
     return false;
   }
 
-  while (true) {
-    writeBigIntBE(nonceBuf, nonce);
-    nonceBuf.copy(packed, 32);
+  if (keccak256native) {
+    // PATH CEPAT: native C keccak
+    while (true) {
+      writeBigIntBE(nonceBuf, nonce);
+      nonceBuf.copy(packed, 32);
 
-    const hash = keccak256native(packed);
-    attempts++;
+      const hash = keccak256native(packed);
+      attempts++;
 
-    if (bufLessThan(hash, diffBuf)) {
-      parentPort.postMessage({
-        type: "found",
-        nonce: nonce.toString(),
-        hash: "0x" + hash.toString("hex"),
-        workerId
-      });
-      break;
+      if (bufLessThan(hash, diffBuf)) {
+        parentPort.postMessage({
+          type: "found",
+          nonce: nonce.toString(),
+          hash: "0x" + hash.toString("hex"),
+          workerId
+        });
+        break;
+      }
+
+      nonce++;
+      if (attempts % REPORT_EVERY === 0) {
+        parentPort.postMessage({ type: "progress", attempts, workerId });
+      }
     }
+  } else {
+    // PATH FALLBACK: ethers.js
+    const { solidityPackedKeccak256 } = require("ethers");
+    const diffBigInt = BigInt(difficulty);
 
-    nonce++;
+    while (true) {
+      const hash = solidityPackedKeccak256(["bytes32", "uint256"], [challenge, nonce]);
+      attempts++;
 
-    if (attempts % REPORT_EVERY === 0) {
-      parentPort.postMessage({ type: "progress", attempts, workerId });
+      if (BigInt(hash) < diffBigInt) {
+        parentPort.postMessage({
+          type: "found",
+          nonce: nonce.toString(),
+          hash,
+          workerId
+        });
+        break;
+      }
+
+      nonce++;
+      if (attempts % REPORT_EVERY === 0) {
+        parentPort.postMessage({ type: "progress", attempts, workerId });
+      }
     }
   }
 }
@@ -98,7 +129,7 @@ else {
   }
 
   function randomStartNonce(workerId, totalWorkers) {
-    const RANGE = BigInt("18446744073709551615"); // 2^64-1
+    const RANGE = BigInt("18446744073709551615");
     const slice = RANGE / BigInt(totalWorkers);
     const base  = slice * BigInt(workerId);
     const jitter = BigInt(Math.floor(Math.random() * 1_000_000));
@@ -171,9 +202,13 @@ else {
     const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
     const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 
-    // Cek apakah native keccak tersedia
+    // Cek native keccak
     let usingNative = false;
-    try { require("keccak"); usingNative = true; } catch (_) {}
+    try {
+      const Keccak = require("keccak");
+      Keccak("keccak256").update(Buffer.alloc(1)).digest();
+      usingNative = true;
+    } catch (_) {}
 
     console.log("======================================");
     console.log("   HASH256 Multi-Core CPU Miner");
@@ -183,11 +218,6 @@ else {
     console.log("CPU Cores:", NUM_CORES);
     console.log("Keccak   :", usingNative ? "native C (fast)" : "ethers.js (fallback)");
     console.log("");
-
-    if (!usingNative) {
-      console.log("TIP: jalankan 'npm install keccak' untuk hashrate lebih tinggi!");
-      console.log("");
-    }
 
     let totalMints = 0;
     const sessionStart = Date.now();
@@ -213,7 +243,6 @@ else {
         console.log("Nonce    :", nonce);
         console.log("Hash     :", hash);
 
-        // Cek epoch belum berubah sebelum submit
         const newState = await contract.miningState();
         if (newState.epoch.toString() !== state.epoch.toString()) {
           console.log("Epoch berubah, skip - ulang mining...");
