@@ -1,0 +1,14 @@
+{
+  "name": "hashminer",
+  "version": "1.0.0",
+  "description": "HASH256 multi-core CPU miner",
+  "main": "miner.js",
+  "scripts": {
+    "start": "node miner.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "ethers": "^6.13.2"
+  },
+  "license": "MIT"
+}
